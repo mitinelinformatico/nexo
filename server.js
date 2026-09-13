@@ -38,22 +38,38 @@ db.getConnection()
 // ==========================================
 
 // Login / Registro por número de teléfono
+// Login / Registro por número de teléfono
 app.post('/api/auth/login-telefono', async (req, res) => {
   const { telefono, nombre } = req.body;
   if (!telefono) return res.status(400).json({ error: 'El teléfono es requerido' });
 
+  const nombreFinal = nombre && nombre.trim() !== '' ? nombre : 'Nuevo Usuario';
+
   try {
     const [users] = await db.query('SELECT * FROM usuarios WHERE telefono = ?', [telefono]);
+
     if (users.length === 0) {
       const [result] = await db.query(
         'INSERT INTO usuarios (nombre, telefono) VALUES (?, ?)',
-        [nombre || 'Nuevo Usuario', telefono]
+        [nombreFinal, telefono]
       );
-      return res.json({ id_usuario: result.insertId, nombre: nombre || 'Nuevo Usuario', telefono });
+      return res.json({ 
+        id_usuario: result.insertId, 
+        nombre: nombreFinal, 
+        telefono: telefono 
+      });
     }
-    res.json(users[0]);
+
+    // Aseguramos que la respuesta devuelva siempre id_usuario
+    const usuarioExistente = users[0];
+    res.json({
+      id_usuario: usuarioExistente.id_usuario || usuarioExistente.id,
+      nombre: usuarioExistente.nombre,
+      telefono: usuarioExistente.telefono
+    });
+
   } catch (err) {
-    console.error(err);
+    console.error('Error en login-telefono:', err);
     res.status(500).json({ error: 'Error interno en el servidor' });
   }
 });
