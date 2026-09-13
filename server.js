@@ -26,36 +26,172 @@ const db = mysql.createPool({
 
 db.getConnection()
   .then(conn => {
-    console.log('✅ [Módulo 1] Conexión exitosa a la Base de Datos nexo_db');
+    console.log('✅ Conexión exitosa a la Base de Datos');
     conn.release();
   })
   .catch(err => {
     console.error('❌ Error de conexión a la Base de Datos:', err.message);
   });
 
+// ==========================================
+// ENDPOINTS DE AUTENTICACIÓN Y CONTACTOS
+// ==========================================
+
+// Login / Registro por número de teléfono
+app.post('/api/auth/login-telefono', async (req, res) => {
+  const { telefono, nombre } = req.body;
+  if (!telefono) return res.status(400).json({ error: 'El teléfono es requerido' });
+
+  try {
+    const [users] = await db.query('SELECT * FROM usuarios WHERE telefono = ?', [telefono]);
+    if (users.length === 0) {
+      const [result] = await db.query(
+        'INSERT INTO usuarios (nombre, telefono) VALUES (?, ?)',
+        [nombre || 'Nuevo Usuario', telefono]
+      );
+      return res.json({ id_usuario: result.insertId, nombre: nombre || 'Nuevo Usuario', telefono });
+    }
+    res.json(users[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error interno en el servidor' });
+  }
+});
+
+// Enviar Invitación de Contacto
+app.post('/api/contactos/invitar', async (req, res) => {
+  const { mi_id, telefono_contacto } = req.body;
+  try {
+    const [target] = await db.query('SELECT id_usuario FROM usuarios WHERE telefono = ?', [telefono_contacto]);
+    if (target.length === 0) {
+      return res.status(404).json({ error: 'El número no pertenece a un usuario registrado' });
+    }
+
+    const contactoId = target[0].id_usuario;
+    if (mi_id === contactoId) {
+      return res.status(400).json({ error: 'No puedes enviarte una invitación a ti mismo' });
+    }
+
+    await db.query(
+      'INSERT INTO contactos (usuario_id, contacto_id, estado) VALUES (?, ?, "pendiente") ON DUPLICATE KEY UPDATE estado = estado',
+      [mi_id, contactoId]
+    );
+    res.json({ mensaje: 'Invitación enviada exitosamente' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al enviar invitación' });
+  }
+});
+
+// Aceptar / Rechazar Invitación
+app.post('/api/contactos/responder', async (req, res) => {
+  const { mi_id, contacto_id, aceptar } = req.body;
+  const nuevoEstado = aceptar ? 'aceptado' : 'bloqueado';
+
+  try {
+    await db.query(
+      'UPDATE contactos SET estado = ? WHERE usuario_id = ? AND contacto_id = ?',
+      [nuevoEstado, contacto_id, mi_id]
+    );
+
+    if (aceptar) {
+      await db.query(
+        'INSERT INTO contactos (usuario_id, contacto_id, estado) VALUES (?, ?, "aceptado") ON DUPLICATE KEY UPDATE estado = "aceptado"',
+        [mi_id, contacto_id]
+      );
+    }
+    res.json({ mensaje: `Invitación ${aceptar ? 'aceptada' : 'rechazada'}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al procesar la respuesta' });
+  }
+});
+
+// Lista de Contactos Aceptados
+app.get('/api/contactos/aceptados/:id', async (req, res) => {
+  try {
+    const [rows] = await db.query(`
+      SELECT u.id_usuario, u.nombre, u.telefono, u.estado_dua 
+      FROM contactos c
+      JOIN usuarios u ON c.contacto_id = u.id_usuario
+      WHERE c.usuario_id = ? AND c.estado = 'aceptado'
+    `, [req.params.id]);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al obtener contactos' });
+  }
+});
+
+// Historial de Mensajes
+app.get('/api/mensajes/:emisor/:receptor', async (req, res) => {
+  const { emisor, receptor } = req.params;
+  try {
+    const sql = `
+      SELECT * FROM mensajes 
+      WHERE (id_emisor = ? AND id_receptor = ?) 
+         OR (id_emisor = ? AND id_receptor = ?)
+      ORDER BY fecha_envio ASC
+    `;
+    const [filas] = await db.execute(sql, [emisor, receptor, receptor, emisor]);
+    res.json(filas);
+  } catch (error) {
+    console.error('❌ Error al obtener mensajes:', error.message);
+    res.status(500).json({ error: 'Error al consultar la base de datos' });
+  }
+});
+
+// Traductor DUA (ARASAAC)
+app.get('/api/traducir-pictogramas', async (req, res) => {
+  const { texto } = req.query;
+  if (!texto) return res.status(400).json({ error: 'Texto requerido' });
+
+  const stopwords = ['el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'a', 'al', 'que', 'en', 'para', 'por', 'con'];
+  const palabras = texto
+    .toLowerCase()
+    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "")
+    .split(/\s+/)
+    .filter(p => !stopwords.includes(p) && p.length > 0);
+
+  const secuenciaPictogramas = [];
+  for (const palabra of palabras) {
+    try {
+      const response = await fetch(`https://api.arasaac.org/v1/pictograms/es/search/${encodeURIComponent(palabra)}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.length > 0) {
+          secuenciaPictogramas.push({
+            palabra: palabra,
+            url: `https://api.arasaac.org/v1/pictograms/${data[0]._id}?download=false`
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`Error buscando pictograma para: ${palabra}`, err);
+    }
+  }
+  res.json({ textoOriginal: texto, pictogramas: secuenciaPictogramas });
+});
+
+// ==========================================
+// SOCKET.IO (CHAT Y WEBRTC EN TIEMPO REAL)
+// ==========================================
+
 const usuariosConectados = new Map();
 
 io.on('connection', (socket) => {
   console.log(`🔌 Cliente conectado: ${socket.id}`);
 
-  // 1. REGISTRAR USUARIO
+  // Registrar Usuario y Unir a su Sala
   socket.on('registrar_usuario', (id_usuario) => {
     if (!id_usuario) return;
     usuariosConectados.set(String(id_usuario), socket.id);
-    console.log(`👤 Usuario ${id_usuario} vinculado al Socket ${socket.id}`);
+    socket.join(`user_${id_usuario}`);
+    console.log(`👤 Usuario ${id_usuario} vinculado a la sala user_${id_usuario} y Socket ${socket.id}`);
   });
 
-  // --- EVENTOS WEBRTC (LLAMADAS Y VIDEOLLAMADAS) ---
-  io.on('connection', (socket) => {
-  // Cuando el cliente nos dice qué ID de usuario es
-  socket.on('registrar_usuario', (userId) => {
-    socket.join(`user_${userId}`);
-    console.log(`Socket ${socket.id} registrado en la sala user_${userId}`);
-  });
-
-  // --- EVENTOS WEBRTC ---
+  // Eventos WebRTC
   socket.on('iniciar_llamada', (data) => {
-    // Reenviar evento directamente a la sala del receptor
     io.to(`user_${data.receptorId}`).emit('llamada_entrante', data);
   });
 
@@ -70,70 +206,47 @@ io.on('connection', (socket) => {
   socket.on('colgar_llamada', (data) => {
     io.to(`user_${data.targetId}`).emit('llamada_finalizada');
   });
-});
 
-  // 2. EVENTO: USUARIO ESCRIBIENDO
+  // Indicador "Escribiendo..."
   socket.on('escribiendo', (data) => {
     const socketReceptor = usuariosConectados.get(String(data.receptor_id));
     if (socketReceptor) {
-      io.to(socketReceptor).emit('usuario_escribiendo', {
-        emisor_id: data.emisor_id,
-        escribiendo: true
-      });
+      io.to(socketReceptor).emit('usuario_escribiendo', { emisor_id: data.emisor_id, escribiendo: true });
     }
   });
 
-  // 3. EVENTO: USUARIO DETUVO ESCRITURA
   socket.on('detuvo_escribiendo', (data) => {
     const socketReceptor = usuariosConectados.get(String(data.receptor_id));
     if (socketReceptor) {
-      io.to(socketReceptor).emit('usuario_escribiendo', {
-        emisor_id: data.emisor_id,
-        escribiendo: false
-      });
+      io.to(socketReceptor).emit('usuario_escribiendo', { emisor_id: data.emisor_id, escribiendo: false });
     }
   });
 
-  // 4. MARCAR LEÍDO
+  // Marcar Mensajes como Leídos
   socket.on('marcar_leido', async (data) => {
     const id_emisor = data?.id_emisor ?? data?.remitente_id ?? null;
     const id_receptor = data?.id_receptor ?? data?.receptor_id ?? null;
-
-    if (!id_emisor || !id_receptor) {
-      console.log('⚠️ Faltan parámetros id_emisor o id_receptor para marcar leído:', data);
-      return;
-    }
+    if (!id_emisor || !id_receptor) return;
 
     try {
-      const query = 'UPDATE mensajes SET estado = "leido" WHERE id_emisor = ? AND id_receptor = ? AND estado != "leido"';
-      await db.query(query, [id_emisor, id_receptor]);
-
-      console.log(`📩 Mensajes marcados como leídos de ${id_emisor} para ${id_receptor}`);
-
+      await db.query('UPDATE mensajes SET estado = "leido" WHERE id_emisor = ? AND id_receptor = ? AND estado != "leido"', [id_emisor, id_receptor]);
       const socketEmisor = usuariosConectados.get(String(id_emisor));
       if (socketEmisor) {
-        io.to(socketEmisor).emit('actualizar_estado_mensajes', {
-          id_emisor,
-          id_receptor,
-          estado: 'leido'
-        });
+        io.to(socketEmisor).emit('actualizar_estado_mensajes', { id_emisor, id_receptor, estado: 'leido' });
       }
     } catch (error) {
       console.error('❌ Error al actualizar estado del mensaje:', error.message);
     }
   });
 
-  // 5. ENVIAR MENSAJE
+  // Enviar Mensaje de Chat
   socket.on('enviar_mensaje', async (datos) => {
     const id_emisor = datos?.id_emisor ?? null;
     const id_receptor = datos?.id_receptor ?? null;
     const contenido = datos?.contenido ?? '';
     const tipo_contenido = datos?.tipo_contenido ?? 'texto';
 
-    if (!id_emisor || !id_receptor) {
-      console.log('⚠️ Datos inválidos al enviar mensaje:', datos);
-      return;
-    }
+    if (!id_emisor || !id_receptor) return;
 
     try {
       const sql = 'INSERT INTO mensajes (id_emisor, id_receptor, contenido, tipo_contenido, estado) VALUES (?, ?, ?, ?, "enviado")';
@@ -159,7 +272,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 6. DESCONEXIÓN
+  // Desconexión
   socket.on('disconnect', () => {
     for (let [id_usuario, socketId] of usuariosConectados.entries()) {
       if (socketId === socket.id) {
@@ -171,62 +284,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Endpoint HTTP GET para obtener el historial de mensajes
-app.get('/api/mensajes/:emisor/:receptor', async (req, res) => {
-  const { emisor, receptor } = req.params;
-  try {
-    const sql = `
-      SELECT * FROM mensajes 
-      WHERE (id_emisor = ? AND id_receptor = ?) 
-         OR (id_emisor = ? AND id_receptor = ?)
-      ORDER BY fecha_envio ASC
-    `;
-    const [filas] = await db.execute(sql, [emisor, receptor, receptor, emisor]);
-    res.json(filas);
-  } catch (error) {
-    console.error('❌ Error al obtener mensajes:', error.message);
-    res.status(500).json({ error: 'Error al consultar la base de datos' });
-  }
-});
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 [Módulo 2] Servidor Nexo activo en el puerto ${PORT}`);
-});
-
-// server.js - Endpoint para traducción de Frases a Pictogramas DUA
-app.get('/api/traducir-pictogramas', async (req, res) => {
-  const { texto } = req.query;
-  if (!texto) return res.status(400).json({ error: 'Texto requerido' });
-
-  // Lista de palabras a ignorar para enfocar la frase en pictogramas clave
-  const stopwords = ['el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'a', 'al', 'que', 'en', 'para', 'por', 'con'];
-  
-  const palabras = texto
-    .toLowerCase()
-    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "")
-    .split(/\s+/)
-    .filter(p => !stopwords.includes(p) && p.length > 0);
-
-  const secuenciaPictogramas = [];
-
-  for (const palabra of palabras) {
-    try {
-      const response = await fetch(`https://api.arasaac.org/v1/pictograms/es/search/${encodeURIComponent(palabra)}`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.length > 0) {
-          const id = data[0]._id;
-          secuenciaPictogramas.push({
-            palabra: palabra,
-            url: `https://api.arasaac.org/v1/pictograms/${id}?download=false`
-          });
-        }
-      }
-    } catch (err) {
-      console.error(`Error buscando pictograma para: ${palabra}`, err);
-    }
-  }
-
-  res.json({ textoOriginal: texto, pictogramas: secuenciaPictogramas });
+  console.log(`🚀 Servidor Nexo activo en el puerto ${PORT}`);
 });
